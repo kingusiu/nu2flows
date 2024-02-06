@@ -40,7 +40,7 @@ sched_config:
   mltools:
     # name: warmup
     name: cyclicwithwarmup
-    epochs_per_cycle: 30
+    epochs_per_cycle: 3
 
   lightning:
     monitor: valid/total_loss

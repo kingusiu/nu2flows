@@ -1,7 +1,8 @@
+from functools import partial
 import logging
 from copy import deepcopy
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Optional, Union
 
 import h5py
 import numpy as np
@@ -9,7 +10,8 @@ import numpy.lib.recfunctions as rf
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader, Dataset
 
-from mltools.mltools.torch_utils import train_valid_split
+from utils.plotting import plot_multi_hists_2
+from utils.torch_utils import train_valid_split
 from src.datamodules.physics import change_from_ptetaphiE
 
 log = logging.getLogger(__name__)
@@ -23,38 +25,28 @@ class H5Dataset(Dataset):
         *,
         file_list: list,
         data_dir: str,
-        n_per_file: int = None,
-        table_name: str = "delphes",
-        met_kins: str | list = "px,py",
-        lep_kins: str | list = "px,py,pz,log_energy",
-        jet_kins: str | list = "px,py,pz,log_energy",
-        nu_kins: str | list = "px,py,pz",
+        n_per_file: Optional[int] = None,
+        met_kins: Union[str, list] = "px,py",
+        # lep_kins: Union[str, list] = "px,py,pz,log_energy",
+        jet_kins: Union[str, list] = "px,py,pz,log_energy",
+        nu_kins: Union[str, list] = "px,py,pz,log_energy",
     ) -> None:
         """
-        Parameters
-        ----------
-        file_list:
-            List of datasets to load
-        data_dir:
-            The location of the datafiles
-        n_per_file:
-            Maximum number of events to load from each file
-        table_name:
-            The name of the table in the hdf5 file
-        met_kins:
-            The vars to use for the lepton kinematics
-        lep_kins:
-            The vars to use for the lepton kinematics
-        jet_kins:
-            The vars to use for the jet kinematics
-        nu_kins:
-            The vars to use for the neutrino (target) kinematics
+        Args:
+            file_list: List of datasets to load
+            data_dir: The location of the datafiles
+            n_per_file: Maximum number of events to load from each file
+            met_kins: The vars to use for the lepton kinematics
+            lep_kins: The vars to use for the lepton kinematics
+            jet_kins: The vars to use for the jet kinematics
+            nu_kins: The vars to use for the neutrino (target) kinematics
+            scaler_nm: The scaler name for pre and post processing the data
         """
         super().__init__()
 
         # Save attributes
         self.met_kins = met_kins.split(",") if isinstance(met_kins, str) else met_kins
-        self.lep_kins = lep_kins.split(",") if isinstance(lep_kins, str) else lep_kins
+        # self.lep_kins = lep_kins.split(",") if isinstance(lep_kins, str) else lep_kins
         self.jet_kins = jet_kins.split(",") if isinstance(jet_kins, str) else jet_kins
         self.nu_kins = nu_kins.split(",") if isinstance(nu_kins, str) else nu_kins
 
@@ -71,30 +63,33 @@ class H5Dataset(Dataset):
         log.info(f"loading {npf} events from each files...")
         self.misc = []
         self.met = []
-        self.lep = []
+        # self.lep = []
         self.jet = []
         self.nu = []
         for file in self.file_list:
             log.info(file.name)
             with h5py.File(file, "r") as f:
-                table = f[table_name]
+                table = f["delphes"]
+                self.decay_channel = table["decay_channel"][:npf]
+                self.decay_channel_mask = self.decay_channel == 0
                 self.misc.append(
-                    np.vstack([table["njets"][:npf], table["nbjets"][:npf]]).T.astype(
+                    np.vstack([table["njets"][:npf][self.decay_channel_mask], table["nbjets"][:npf][self.decay_channel_mask]]).T.astype(
                         "float"
                     )
                 )
                 self.misc_vars = ["njets", "nbjets"]
-                self.met.append(rf.structured_to_unstructured(table["MET"][:npf]))
-                self.lep.append(rf.structured_to_unstructured(table["leptons"][:npf]))
-                self.jet.append(rf.structured_to_unstructured(table["jets"][:npf]))
-                self.nu.append(rf.structured_to_unstructured(table["neutrinos"][:npf]))
+                self.jet_vars = ['pt', 'eta', 'phi', 'energy', 'is_tagged']
+                self.met.append(rf.structured_to_unstructured(table["MET"][:npf][self.decay_channel_mask]))
+                # self.lep.append(rf.structured_to_unstructured(table["leptons"][:npf][self.decay_channel_mask]))
+                self.jet.append(rf.structured_to_unstructured(table["jets"][*self.jet_vars][:npf][self.decay_channel_mask]))
+                self.nu.append(rf.structured_to_unstructured(table["neutralinos"][:npf][self.decay_channel_mask]))
                 self.met_vars = table["MET"].dtype.names
-                self.lep_vars = table["leptons"].dtype.names
-                self.jet_vars = table["jets"].dtype.names
-                self.nu_vars = table["neutrinos"].dtype.names
+                # self.lep_vars = table["leptons"].dtype.names
+                # self.jet_vars = table["jets"].dtype.names[:-1]
+                self.nu_vars = table["neutralinos"].dtype.names
         self.misc = np.vstack(self.misc).astype(np.float32)
         self.met = np.vstack(self.met).astype(np.float32)
-        self.lep = np.vstack(self.lep).astype(np.float32)
+        # self.lep = np.vstack(self.lep).astype(np.float32)
         self.jet = np.vstack(self.jet).astype(np.float32)
         self.nu = np.vstack(self.nu).astype(np.float32)
         log.info(f"{len(self.met)} events loaded")
@@ -103,56 +98,77 @@ class H5Dataset(Dataset):
         self.jet_mask = ~np.all(self.jet == 0, axis=-1)
 
         # Neutrinos are always ordered particle -> antiparticle, so drop pdgid
-        self.nu = self.nu[..., [1, 2, 3]]
-        self.nu_vars = [self.nu_vars[i] for i in [1, 2, 3]]
+        self.nu = self.nu[..., [1, 2, 3, 4]]
+        self.nu_vars = [self.nu_vars[i] for i in [1, 2, 3, 4]]
 
-        # Ensure that the lepton array is particle, anti (just like neutrino)
-        order = np.argsort(self.lep[..., -2])  # orders by charge
-        order = np.expand_dims(order, -1)
-        self.lep = np.take_along_axis(self.lep, order, axis=1)
+        # ensure that the lepton array is particle, anti (just like neutrino)
+        # order = np.argsort(self.lep[..., -2])  # orders by charge
+        # order = np.expand_dims(order, -1)
+        # self.lep = np.take_along_axis(self.lep, order, axis=1)
 
         # convert to specified coordinates
         log.info("converting data to specified coordinates...")
         self.met, self.met_vars = change_from_ptetaphiE(
             self.met, self.met_vars, self.met_kins
         )
-        self.lep, self.lep_vars = change_from_ptetaphiE(
-            self.lep, self.lep_vars, self.lep_kins
-        )
+        # self.lep, self.lep_vars = change_from_ptetaphiE(
+        #     self.lep, self.lep_vars, self.lep_kins
+        # )
         self.jet, self.jet_vars = change_from_ptetaphiE(
             self.jet, self.jet_vars, self.jet_kins
         )
         self.nu, self.nu_vars = change_from_ptetaphiE(
-            self.nu, self.nu_vars, self.nu_kins, n_dim=3
+            self.nu, self.nu_vars, self.nu_kins, n_dim=4
+        )
+
+        # Ensure zero padding of the jets post transformation
+        self.jet[~self.jet_mask] = 0
+
+    def plot_variables(self, path: str = "plots") -> None:
+        """Plot some histograms showing the dataset distributions."""
+
+        # Ensure the path exists
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+
+        # Plot each data type individually
+        plot_multi_hists_2(self.misc, "misc", self.misc_vars, path=Path(path, "misc"))
+        plot_multi_hists_2(self.met, "met", self.met_vars, path=Path(path, "met"))
+        # plot_multi_hists_2(
+        #     self.lep.reshape(-1, len(self.lep_vars)),
+        #     "lep",
+        #     self.lep_vars,
+        #     path=Path(path, "lep"),
+        # )
+        plot_multi_hists_2(
+            self.nu.reshape(-1, len(self.nu_vars)),
+            "nu",
+            self.nu_vars,
+            path=Path(path, "nu"),
+        )
+        plot_multi_hists_2(
+            self.jet[self.jet_mask],
+            "jet",
+            self.jet_vars,
+            path=Path(path, "jet"),
         )
 
     def __len__(self) -> int:
         return len(self.met)
 
     def __getitem__(self, idx: int) -> list:
-        """Return dictionaries for the inputs and the targets."""
-        inputs = {
-            "misc": self.misc[idx],
-            "met": self.met[idx],
-            "leptons": self.lep[idx],
-            "jets": (self.jet[idx], self.jet_mask[idx]),
-        }
-        targets = {"neutrino": self.nu[idx][0], "antineutrino": self.nu[idx][1]}
-        return inputs, targets
+        """Return a list of information pulled from the ndarrays."""
+        return [
+            self.misc[idx],
+            self.met[idx],
+            # self.lep[idx],
+            self.jet[idx],
+            self.nu[idx],
+        ]
 
-    def get_input_dims(self) -> tuple:
+    def get_dims(self) -> tuple:
         """Return the typical dimensions of a data sample."""
-        return {
-            k: v[0].shape[-1] if isinstance(v, tuple) else v.shape[-1]
-            for k, v in self[0][0].items()
-        }
-
-    def get_target_dims(self) -> tuple:
-        """Return the typical dimensions of a data sample."""
-        return {
-            k: v[0].shape[-1] if isinstance(v, tuple) else v.shape[-1]
-            for k, v in self[0][1].items()
-        }
+        return tuple(x.shape for x in self[0])
 
 
 class H5DataModule(pl.LightningDataModule):
@@ -166,16 +182,11 @@ class H5DataModule(pl.LightningDataModule):
     ) -> None:
         """The datamodule for providing dilepton information.
 
-        Parameters
-        ----------
-        train_conf:
-            Config for the training dataset class.
-        test_conf:
-            Config for the testing dataset class.
-        loader_conf:
-            Config for the pytorch dataloader.
-        val_frac:
-            Fraction of dataset held out for validaiton. Defaults to 0.1.
+        Args:
+            train_conf: Config for the training dataset class.
+            test_conf: Config for the testing dataset class.
+            loader_conf: Config for the pytorch dataloader.
+            val_frac: Fraction of dataset held out for validaiton. Defaults to 0.1.
         """
         super().__init__()
         self.save_hyperparameters(logger=False)
@@ -188,7 +199,7 @@ class H5DataModule(pl.LightningDataModule):
     def setup(self, stage: str) -> None:
         if stage in ["fit", "validate"]:
             self.dataset = H5Dataset(**self.hparams.train_conf)
-            # self.dataset.plot_variables("plots")
+            self.dataset.plot_variables("plots")
             self.train_set, self.valid_set = train_valid_split(
                 self.dataset, self.hparams.val_frac
             )
@@ -199,13 +210,9 @@ class H5DataModule(pl.LightningDataModule):
             self.test_set = H5Dataset(**self.hparams.test_conf)
             self.n_test_samples = len(self.test_set)
 
-    def input_dimensions(self) -> tuple:
-        """Return the typical dimensions of a input sample."""
-        return self.miniset.get_input_dims()
-
-    def target_dimensions(self) -> tuple:
-        """Return the typical dimensions of the target sample."""
-        return self.miniset.get_target_dims()
+    def get_dims(self) -> tuple:
+        """Return the typical dimensions of a data sample."""
+        return self.miniset.get_dims()
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(self.train_set, **self.hparams.loader_conf, shuffle=True)

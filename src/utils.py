@@ -15,8 +15,8 @@ from src.datamodules.physics import Mom4Vec, delR
 
 
 def read_dilepton_file(file_path: Path, require_tops: bool = False) -> DotMap:
-    """Reads in data from an HDF file, returning the collection of information as a
-    DotMap object."""
+    """Reads in data from an HDF file, returning the collection of information
+    as a DotMap object."""
 
     # Read the delphes table as a dotmap object
     file_data = DotMap()
@@ -30,27 +30,27 @@ def read_dilepton_file(file_path: Path, require_tops: bool = False) -> DotMap:
 
             # Neutrinos has superfluous PDGID at the front which must be removed
             # They also don't have energy!
-            if key == "neutrinos":
-                file_data[key] = file_data[key][..., 1:4]
+            if key == "neutralinos":
+                file_data[key] = file_data[key][..., 1:5]
 
             # Leptons need to be ordered particle/antiparticle just like neutrino
-            if key == "leptons":
-                order = np.argsort(file_data[key][..., -2])  # orders by charge
-                order = np.expand_dims(order, -1)
-                file_data[key] = np.take_along_axis(file_data[key], order, axis=1)
+            # if key == "leptons":
+            #     order = np.argsort(file_data[key][..., -2])  # orders by charge
+            #     order = np.expand_dims(order, -1)
+            #     file_data[key] = np.take_along_axis(file_data[key], order, axis=1)
 
     # Change the particle entries to 4 vector objects
-    for key in ["MET", "neutrinos", "leptons", "jets"]:
+    for key in ["MET", "neutralinos", "leptons", "jets"]:
         if key in list(file_data.keys()):
-            file_data[key] = Mom4Vec(file_data[key], is_cartesian=False)
+            file_data[key] = Mom4Vec(file_data[key], is_cartesian=False, final_is_mass = key == "neutralinos")
             file_data[key].to_cartesian()
 
     # Get the pairing between the lepton and the jets
-    lep_jet, antilep_jet = get_lj_pairing(
-        file_data.leptons, file_data.jets, is_b=file_data.jets.oth
-    )
-    file_data.lep_jet = lep_jet
-    file_data.antilep_jet = antilep_jet
+    # lep_jet, antilep_jet = get_lj_pairing(
+    #     file_data.leptons, file_data.jets, is_b=file_data.jets.oth
+    # )
+    # file_data.lep_jet = lep_jet
+    # file_data.antilep_jet = antilep_jet
 
     # Count the number of b quarks matched to the jets in the data
     has_b = (file_data.jets_indices == 0).sum(axis=-1).astype("bool")
@@ -63,8 +63,7 @@ def read_dilepton_file(file_path: Path, require_tops: bool = False) -> DotMap:
     return file_data
 
 
-def argmin_last_N_axes(A: np.ndarray, N: np.ndarray) -> np.ndarray:
-    """Returns the indices of the minimum values of the last N axes of A."""
+def argmin_last_N_axes(A, N):
     s = A.shape
     new_shp = s[:-N] + (np.prod(s[-N:]),)
     max_idx = A.reshape(new_shp).argmin(-1)
